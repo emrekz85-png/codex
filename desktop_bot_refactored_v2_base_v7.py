@@ -1627,6 +1627,7 @@ class TradeManager:
         self.slippage_pct = TRADING_CONFIG["slippage_rate"]
         self.risk_per_trade_pct = TRADING_CONFIG.get("risk_per_trade_pct", 0.01)
         self.max_portfolio_risk_pct = TRADING_CONFIG.get("max_portfolio_risk_pct", 0.03)
+        self.usable_balance_pct = TRADING_CONFIG.get("usable_balance_pct", 1.0)
         # -----------------------------
 
         if self.persist:
@@ -1675,8 +1676,12 @@ class TradeManager:
         del self.cooldowns[k]
         return False
 
-    def _calculate_portfolio_risk_pct(self, wallet_balance: float) -> float:
-        if wallet_balance <= 0:
+    def _calculate_equity(self) -> float:
+        open_pnl = sum(float(t.get("pnl", 0.0)) for t in self.open_trades)
+        return self.wallet_balance + self.locked_margin + open_pnl
+
+    def _calculate_portfolio_risk_pct(self, equity: float) -> float:
+        if equity <= 0:
             return 0.0
 
         total_open_risk = 0.0
@@ -1690,7 +1695,7 @@ class TradeManager:
             open_risk_amount = sl_fraction * size * entry_price
             total_open_risk += open_risk_amount
 
-        return total_open_risk / wallet_balance
+        return total_open_risk / equity
 
     def open_trade(self, signal_data):
         with self.lock:
@@ -1738,7 +1743,8 @@ class TradeManager:
 
             # Apply risk multiplier to effective risk per trade
             effective_risk_pct = self.risk_per_trade_pct * risk_multiplier
-            current_portfolio_risk_pct = self._calculate_portfolio_risk_pct(self.wallet_balance)
+            equity = self._calculate_equity()
+            current_portfolio_risk_pct = self._calculate_portfolio_risk_pct(equity)
             if current_portfolio_risk_pct + effective_risk_pct > self.max_portfolio_risk_pct:
                 print(
                     f"⚠️ Portföy risk limiti aşılıyor: mevcut %{current_portfolio_risk_pct * 100:.2f}, "
@@ -1746,12 +1752,11 @@ class TradeManager:
                 )
                 return
 
-            wallet_balance = self.wallet_balance
-            if wallet_balance <= 0:
+            if equity <= 0:
                 print("⚠️ Cüzdan bakiyesi 0 veya negatif, işlem açılamadı.")
                 return
 
-            risk_amount = wallet_balance * effective_risk_pct
+            risk_amount = equity * effective_risk_pct
             sl_distance = abs(real_entry - sl_price)
             if sl_distance <= 0:
                 print("⚠️ Geçersiz SL mesafesi, işlem atlandı.")
@@ -1768,8 +1773,13 @@ class TradeManager:
             leverage = TRADING_CONFIG["leverage"]
             required_margin = position_notional / leverage
 
-            if required_margin > wallet_balance:
-                max_notional = wallet_balance * leverage
+            available_margin = equity * self.usable_balance_pct - self.locked_margin
+            if available_margin <= 0:
+                print("⚠️ Kullanılabilir marjin kalmadı, işlem atlandı.")
+                return
+
+            if required_margin > available_margin:
+                max_notional = max(available_margin, 0) * leverage
                 if max_notional <= 0:
                     print("⚠️ Yetersiz bakiye nedeniyle işlem açılamadı.")
                     return
@@ -1777,9 +1787,12 @@ class TradeManager:
                 position_notional = max_notional
                 position_size = position_notional / real_entry
                 required_margin = position_notional / leverage
+                risk_amount = sl_fraction * position_notional
                 print(
                     f"⚠️ Gerekli marjin bakiyeyi aşıyor, pozisyon {scale_factor:.2f} oranında düşürüldü."
                 )
+            else:
+                risk_amount = sl_fraction * position_notional
 
             # open_time_utc'yi datetime string'e çevir (numpy.datetime64, pd.Timestamp veya datetime olabilir)
             _otv = signal_data.get("open_time_utc") or datetime.utcnow()
@@ -1804,13 +1817,14 @@ class TradeManager:
                 "use_dynamic_pbema_tp": use_dynamic_pbema_tp,
                 "opt_rr": opt_rr,
                 "opt_rsi": opt_rsi,
+                "risk_amount": risk_amount,
             }
 
             self.wallet_balance -= required_margin
             self.locked_margin += required_margin
 
             self.open_trades.append(new_trade)
-            new_portfolio_risk_pct = self._calculate_portfolio_risk_pct(self.wallet_balance)
+            new_portfolio_risk_pct = self._calculate_portfolio_risk_pct(self._calculate_equity())
 
             print(
                 f"📈 İşlem Açıldı | Entry: {real_entry:.4f}, SL: {sl_price:.4f}, "
@@ -5520,6 +5534,7 @@ class SimTradeManager:
         self.slippage_pct = TRADING_CONFIG["slippage_rate"]
         self.risk_per_trade_pct = TRADING_CONFIG.get("risk_per_trade_pct", 0.01)
         self.max_portfolio_risk_pct = TRADING_CONFIG.get("max_portfolio_risk_pct", 0.03)
+        self.usable_balance_pct = TRADING_CONFIG.get("usable_balance_pct", 1.0)
         self._id = 1
         # R-Multiple tracking: PnL / Risk Amount per trade
         # E[R] = sum(r_multiples) / len(r_multiples)
@@ -5558,8 +5573,12 @@ class SimTradeManager:
         del self.cooldowns[k]
         return False
 
-    def _calculate_portfolio_risk_pct(self, wallet_balance: float) -> float:
-        if wallet_balance <= 0:
+    def _calculate_equity(self) -> float:
+        open_pnl = sum(float(t.get("pnl", 0.0)) for t in self.open_trades)
+        return self.wallet_balance + self.locked_margin + open_pnl
+
+    def _calculate_portfolio_risk_pct(self, equity: float) -> float:
+        if equity <= 0:
             return 0.0
 
         total_open_risk = 0.0
@@ -5573,7 +5592,7 @@ class SimTradeManager:
             open_risk_amount = sl_fraction * size * entry_price
             total_open_risk += open_risk_amount
 
-        return total_open_risk / wallet_balance
+        return total_open_risk / equity
 
     def _next_id(self):
         tid = self._id
@@ -5632,15 +5651,15 @@ class SimTradeManager:
 
         # Apply risk multiplier to effective risk per trade
         effective_risk_pct = self.risk_per_trade_pct * risk_multiplier
-        current_portfolio_risk_pct = self._calculate_portfolio_risk_pct(self.wallet_balance)
+        equity = self._calculate_equity()
+        current_portfolio_risk_pct = self._calculate_portfolio_risk_pct(equity)
         if current_portfolio_risk_pct + effective_risk_pct > self.max_portfolio_risk_pct:
             return False
 
-        wallet_balance = self.wallet_balance
-        if wallet_balance <= 0:
+        if equity <= 0:
             return False
 
-        risk_amount = wallet_balance * effective_risk_pct
+        risk_amount = equity * effective_risk_pct
         sl_distance = abs(real_entry - sl_price)
         if sl_distance <= 0:
             return False
@@ -5655,13 +5674,20 @@ class SimTradeManager:
         leverage = TRADING_CONFIG["leverage"]
         required_margin = position_notional / leverage
 
-        if required_margin > wallet_balance:
-            max_notional = wallet_balance * leverage
+        available_margin = equity * self.usable_balance_pct - self.locked_margin
+        if available_margin <= 0:
+            return False
+
+        if required_margin > available_margin:
+            max_notional = max(available_margin, 0) * leverage
             if max_notional <= 0:
                 return False
             position_notional = max_notional
             position_size = position_notional / real_entry
             required_margin = position_notional / leverage
+            risk_amount = sl_fraction * position_notional
+        else:
+            risk_amount = sl_fraction * position_notional
 
         open_time_val = trade_data.get("open_time_utc") or datetime.utcnow()
         # numpy.datetime64, pd.Timestamp veya datetime olabilir - hepsini datetime'a çevir
@@ -5707,7 +5733,7 @@ class SimTradeManager:
         self.wallet_balance -= required_margin
         self.locked_margin += required_margin
         self.open_trades.append(new_trade)
-        new_portfolio_risk_pct = self._calculate_portfolio_risk_pct(self.wallet_balance)
+        new_portfolio_risk_pct = self._calculate_portfolio_risk_pct(self._calculate_equity())
 
         print(
             f"[SIM] İşlem Açıldı | Entry: {real_entry:.4f}, SL: {sl_price:.4f}, "
